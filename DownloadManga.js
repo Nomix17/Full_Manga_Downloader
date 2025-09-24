@@ -2,17 +2,31 @@ import fetch from "node-fetch";
 import https from "https";
 import {question} from "readline-sync";
 import {fileURLToPath} from "url";
+import {spawn} from "child_process";
 import path from "path";
 import fs from "fs";
+import sharp from "sharp";
+import imagesToPdf from "./MergeImagesInPdf.js";
 
 const __filename =  fileURLToPath(import.meta.url);
 const __dirname = path.dirname( __filename);
+const pythonBinaryPath = "/usr/bin/python3";
 
 const tempDownloadDirectory = "/tmp/mangaDownload";
 const downloadPathCacheFile = path.join(__dirname,"downloadPath");
+const downloadPageBin = path.join(__dirname,"downloadPage");
+
 let finalDestinationDir = getFinalDestinationPath();
 
+let displayPoints = ["",".","..","..."];
+let loadingSlider = "=====================================";
+
+let outputInterval;
 const agent = new https.Agent({ family: 4 })
+
+function sleep(ms){
+  return new Promise(resolve => setTimeout(resolve,ms));
+}
 
 function getFinalDestinationPath(){
   if(fs.existsSync(downloadPathCacheFile)){
@@ -36,25 +50,60 @@ function saveFinalDestination(){
   return finalDestinationInput; 
 }
 
-async function getMangaId(name) {
-  let url = `https://api.mangadex.org/manga?title=${encodeURIComponent(name)}&limit=100`;
-  let res = await fetch(url, { agent });
-  let data = await res.json();
-  let foundedManga = data.data.map(manga => {
-    return {
-      id:manga?.id,
-      title:manga?.attributes?.title?.en
-    }
-  });
-  foundedManga.forEach((manga,index) => {
-    console.log(index+"- "+manga.title);
-  });
+async function getMangaId(name,attempt=0) {
+  try{
+    let counter = 0;
+    outputInterval = setInterval(()=>{
+      process.stdout.clearLine(0);
+      process.stdout.cursorTo(0);
+      process.stdout.write(`\rSearching For ${name} ${displayPoints[counter]}`);
+      counter = (counter+1)%displayPoints.length;
+    },500);
 
-  let mangaIndex = parseInt(question("\nEnter the number of manga to download: "));
-  return {
-    id: foundedManga[mangaIndex]?.id,
-    title: foundedManga[mangaIndex]?.title
-  };
+
+    let url = `https://api.mangadex.org/manga?title=${encodeURIComponent(name)}&limit=100`;
+    let res = await fetch(url, { agent });
+    let data = await res.json();
+    clearInterval(outputInterval);
+    if(!data.data.length){
+      console.clear();   
+      console.log(`Cannot Find a Manga Named: ${name}`);
+      let SearchKeyword = question("Enter Manga Name: ");
+      let res = await getMangaId(SearchKeyword);
+      return res;
+    }
+    console.clear();
+
+    let foundedManga = data.data.map(manga => {
+      return {
+        id:manga?.id,
+        title:manga?.attributes?.title?.en
+      }
+    });
+  
+    console.log(`Results for ${name}:\n`);
+    foundedManga.forEach((manga,index) => {
+      console.log(index+"- "+manga.title);
+    });
+
+    let mangaIndex = parseInt(question("\nEnter the number of manga to download: "));
+    return {
+      id: foundedManga[mangaIndex]?.id,
+      title: foundedManga[mangaIndex]?.title
+    };
+  }catch(err){
+    clearInterval(outputInterval);
+    if(attempt < 5){
+      console.log("Error:",err.message);
+      await sleep(2000);
+      attempt++;
+      let res = await getMangaId(name,attempt);
+      return res;
+    }else{
+      console.log("Cannot Connect to Server, Please Check Your Internet Connection");
+      return undefined;
+    }
+  }
 }
 
 async function getLanguage(mangaId){
@@ -66,6 +115,7 @@ async function getLanguage(mangaId){
   const languagesNames = new Intl.DisplayNames(["en"],{
     type:"language"
   });
+  clearInterval(outputInterval);
   console.log("Available Languages:\n");
   availableLanguages?.forEach((language,index) =>{
     console.log(index+"- "+languagesNames.of(language));
@@ -106,55 +156,212 @@ async function getMangaChapters(mangaId,language){
     offset += limit;
     counter += fetchedChaptersData.length;
   }
+  clearInterval(outputInterval);
   let removeDuplication = [ ...new Map(chapters.map(chap => [chap.id, chap])).values() ];
   return removeDuplication;
 }
-async function downloadChapters(ChaptersObjs,DownloadDir){
+
+async function downloadChapters(ChaptersObjs,DownloadDir,FinalDestination){
+  clearInterval(outputInterval);
   if(!fs.existsSync(DownloadDir))
     fs.mkdirSync(DownloadDir,{recursive:true});
+  if(!fs.existsSync(FinalDestination))
+    fs.mkdirSync(FinalDestination,{recursive:true});
+
   let logs = [];
-  ChaptersObjs.forEach(async(chapObj) => {
-      let res = await getChapterPages(chapObj.id,chapObj.title);
-      // logs.push(res);
+  let index = 0;
+  let tasks = ChaptersObjs.map((chapObj,index) => {
+    let pdfFinalTitle = `Chapter${chapObj.chapter_number}-${ChaptersObjs[index].title}.pdf`;
+    let pdfFinalPath = path.join(FinalDestination,pdfFinalTitle);
+    if(!fs.existsSync(pdfFinalPath))
+      return ()=>getChapterPages(ChaptersObjs[index].id,pdfFinalPath ,DownloadDir);
+    else
+      return ()=>{return{status:"exist",chapter_id:ChaptersObjs[index].id, download_path:pdfFinalPath}};
   });
+  for(const [index,task] of tasks.entries()){
+    // fs.readdirSync(DownloadDir).forEach(file => {fs.unlinkSync(path.join(DownloadDir,file))});
+    console.log(`\rDownloading Chapter ${ChaptersObjs[index].chapter_number} - ${ChaptersObjs[index].title}`);
+
+    let res = await task();
+    clearInterval(outputInterval);
+    logs.push(res);
+  }
+  clearInterval(outputInterval);
+  return logs;
 }
 
-async function getChapterPages(chapterId, chapterTitle, tryNumber=0){
+async function downloadImagesFromSourceLink(hash, files, DownloadDir){
+  let tasks = files.map((fileFromServer,index) => {
+    let fileName = `${hash}-Page${index}${path.extname(fileFromServer)}`;
+    return ()=>downloadImage(hash, fileFromServer, fileName, DownloadDir,files.length,index);
+  });
+
   try{
+    let results=[];
+    for(const task of tasks){
+      let res = await task();
+      results.push(res);
+    }
+    return results;
+    
+  }catch(err){
+    console.error("Download Failed:",err);
+    return [];
+  }
+}
+
+function downloadImage(hash, fileFromServer, fileName,DownloadDir,numberOfPages,index,attempt=0){
+  return new Promise(async(res,rej)=>{
+    if(!fs.existsSync(DownloadDir))
+      fs.mkdirSync(DownloadDir,{recursive:true});
+    
+    let fileFullPath = path.join(DownloadDir,fileName);
+
+    let fileUrl = `https://uploads.mangadex.org/data/${hash}/${fileFromServer}`;
+    let DownloadProcess;
+    try{
+      await sharp(fileFullPath).metadata();
+      DownloadProcess = spawn(pythonBinaryPath,["-c","exit(0)"],{inherite:true});
+    }catch(err){
+      // DownloadProcess = spawn(pythonBinaryPath,[path.join(__dirname,"downloadPage.py") ,fileUrl,DownloadDir,fileName],{inherite:true});
+      DownloadProcess = spawn(downloadPageBin,[fileUrl,DownloadDir,fileName],{inherite:true});
+    }
+    DownloadProcess.on("close", async(code) => {
+      if (code === 0) {
+        // loading =====> animation 
+        let FullSizeOfSlider = loadingSlider.length;
+        let SizeOfSlider = (FullSizeOfSlider * index) / numberOfPages
+
+        if(SizeOfSlider != FullSizeOfSlider){
+          let Slider = loadingSlider.slice(0,SizeOfSlider);
+          let whiteSpace = "                                      ";
+          let sliderWhiteSpace = whiteSpace.slice(0,FullSizeOfSlider-SizeOfSlider);
+          let percentage = ((SizeOfSlider*100)/FullSizeOfSlider).toFixed(2);
+          process.stdout.clearLine(0);
+          process.stdout.cursorTo(0);
+          process.stdout.write(`|${Slider}>${sliderWhiteSpace}|  ${percentage}%`);
+        }
+
+        res(fileFullPath);
+      }else{
+        process.stdout.write("\r");
+        console.log("Failed to download " + fileName+", attempt:",attempt);
+        if(attempt > 40) rej("failed to download " + fileFullPath);
+        await sleep(2000);
+        attempt++;
+        downloadImage(hash, fileFromServer, fileName,DownloadDir,numberOfPages,index,attempt);
+      }
+    });
+    DownloadProcess.on("error", err => {
+      rej("failed to start download process: " + err);
+    });
+  })
+}
+
+
+async function getChapterPages(chapterId, pdfFinalPath, DownloadDir, tryNumber=0){
+  try{
+    clearInterval(outputInterval);
     let url = `https://api.mangadex.org/at-home/server/${chapterId}`;
     let res = await fetch(url,{agent});
     let data = await res.json();
-    console.log(data);
-    return {status:"success",chapter_id:chapterId,chapter_title:chapterTitle, download_path:downloadPath};
+    let hash = data.chapter?.hash;
+    let files = data.chapter?.data;
+
+    let paths = await downloadImagesFromSourceLink(hash, files, DownloadDir);
+    await imagesToPdf(paths,pdfFinalPath);
+    paths.forEach(file => {fs.unlinkSync(file)});
+    console.clear();
+    return {status:"success",chapter_id:chapterId, download_path:pdfFinalPath};
   }catch(error){
-    if(tryNumber > 10) return {status:"failure",chapter_id:chapterId,chapter_title:chapterTitle};
+    console.log("\nDownload Failed");
+    console.error(error.message);
+    await sleep(2000);
+    if(tryNumber > 2)
+      return {status:"failure",chapter_id:chapterId, download_path:pdfFinalPath};
     tryNumber++;
-    getChapterPages(chapterId, chapterTitle, tryNumber);
+    let res = await getChapterPages(chapterId, pdfFinalPath, DownloadDir, tryNumber);
+    return res;
   }
 }
 
 async function DownloadManga(name){
+  console.clear();
+  let counter = 0;
   let SearchedManga = await getMangaId(name);
+  if(SearchedManga == undefined) return;
   let mangaId = SearchedManga.id;
   let mangaTitle = SearchedManga.title;
+
   console.clear();
-  console.log("loading ...");
+  outputInterval = setInterval(()=>{
+    process.stdout.clearLine(0);
+    process.stdout.cursorTo(0);
+    process.stdout.write("\rLoading languages "+displayPoints[counter]);
+    counter = (counter+1)%displayPoints.length;
+  },500);
 
   let Language = await getLanguage(mangaId);
-  console.clear();
-  console.log("getting Chapters Information ...");
 
-  let ChaptersObjs = await getMangaChapters(mangaId, Language);
+  console.clear();
 
   if (finalDestinationDir == undefined) finalDestinationDir = await saveFinalDestination();
 
-  let MangaTemporaryDownloadDirectory = path.join(tempDownloadDirectory,mangaTitle);
-  await downloadChapters(ChaptersObjs,MangaTemporaryDownloadDirectory);
+  console.clear();
+  outputInterval = setInterval(()=>{
+    process.stdout.clearLine(0);
+    process.stdout.cursorTo(0);
+    process.stdout.write("\rGetting Chapters Information "+displayPoints[counter]);
+    counter = (counter+1)%displayPoints.length;
+  },500);
 
-  let MangaFinalDestination = path.join(finalDestinationDir,FinalDestination);
-  await moveChaptersToFinalDestination(MangaTemporaryDownloadDirectory, MangaFinalDestination);
+
+  let ChaptersObjs = await getMangaChapters(mangaId, Language);
+  console.clear();
+  console.log("Number of Chapters Founded:", ChaptersObjs.length);
+
+  let downloadAll = await question("Do you want to Download All the Chapters?(Y/n): ");
+  if(downloadAll.toString().toLowerCase().includes("n")){
+    let fromChap;
+    let toChap;
+    while(true){
+      fromChap = parseInt(await question("From: "));
+      console.clear();
+      toChap = parseInt(await question("To: "));
+
+      if((0 <= fromChap  && fromChap < ChaptersObjs.length) &&
+        (0 <= toChap  && toChap < ChaptersObjs.length) &&
+        (fromChap <= toChap))
+      {
+
+        if(fromChap == toChap)
+          ChaptersObjs =  [ChaptersObjs[fromChap]];
+        else
+          ChaptersObjs.slice(fromChap,toChap);
+
+        break;
+      }
+      else{
+        console.clear();
+        console.log("the segment you provide is not valid, please try again");
+      }
+    }
+  }
+  clearInterval(outputInterval);
+  console.clear();
+  outputInterval = setInterval(()=>{
+    process.stdout.clearLine(0);
+    process.stdout.cursorTo(0);
+    process.stdout.write("\rDownloading Chapters "+displayPoints[counter]);
+    counter = (counter+1)%displayPoints.length;
+  },500);
+
+  let MangaTemporaryDownloadDirectory = path.join(tempDownloadDirectory,mangaTitle);
+  let MangaFinalDestination = path.join(finalDestinationDir,mangaTitle);
+
+  let chaptersDownoadLogs = await downloadChapters(ChaptersObjs,MangaTemporaryDownloadDirectory,MangaFinalDestination);
+  logs.forEach(chapLog=>{console.log(`${chapLog.download_path} Download was a ${chapLog.status}`)});
 }
 
-// saveFinalDestination();
-
-DownloadManga("berserk");
+let SearchKeyword = question("Enter Manga Name: ");
+DownloadManga(SearchKeyword);

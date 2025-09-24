@@ -2,6 +2,8 @@
   "type": "module",
   "dependencies": {
     "node-fetch": "^2.7.0",
-    "readline-sync": "^1.4.10"
+    "pdf-lib": "^1.17.1",
+    "readline-sync": "^1.4.10",
+    "sharp": "^0.34.4"
   }
 }
