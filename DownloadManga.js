@@ -18,6 +18,7 @@ const downloadPageBin = path.join(__dirname,"downloadPage");
 
 let finalDestinationDir = getFinalDestinationPath();
 
+let defaultLanguage = "en";
 let displayPoints = ["",".","..","..."];
 let loadingSlider = "=====================================";
 
@@ -83,10 +84,15 @@ async function getMangaId(name,attempt=0) {
   
     console.log(`Results for ${name}:\n`);
     foundedManga.forEach((manga,index) => {
-      console.log(index+"- "+manga.title);
+      if(index == 0)
+        console.log("\x1b[1;97m%s\x1b[0m", index + "- " + manga.title);
+      else
+        console.log(index+"- "+manga.title);
     });
 
-    let mangaIndex = parseInt(question("\nEnter the number of manga to download: "));
+    let mangaIndex = parseInt(question("\nEnter the number of manga to download (0 by default): "));
+    if(isNaN(mangaIndex)) mangaIndex = 0;
+
     return {
       id: foundedManga[mangaIndex]?.id,
       title: foundedManga[mangaIndex]?.title
@@ -110,6 +116,7 @@ async function getLanguage(mangaId){
   let url = `https://api.mangadex.org/manga/${mangaId}`;
   let res = await fetch(url, {agent});
   let data = await res.json();
+  let defaultLanguageIndex;
   console.clear();
   let availableLanguages = data?.data?.attributes?.availableTranslatedLanguages;
   const languagesNames = new Intl.DisplayNames(["en"],{
@@ -118,9 +125,16 @@ async function getLanguage(mangaId){
   clearInterval(outputInterval);
   console.log("Available Languages:\n");
   availableLanguages?.forEach((language,index) =>{
-    console.log(index+"- "+languagesNames.of(language));
+    if(language == defaultLanguage){
+      console.log("\x1b[1;97m%s\x1b[0m", index+"- "+languagesNames.of(language));
+      defaultLanguageIndex = index;
+    }
+    else 
+      console.log(index+"- "+languagesNames.of(language));
   });
-  let languageIndex = parseInt(question("\nEnter the number of the language you want: "));
+  let languageIndex = parseInt(question(`\nEnter the number of the language you want (${languagesNames.of(defaultLanguage)} by default): `));
+  if(isNaN(languageIndex)) languageIndex = defaultLanguageIndex;
+
   return availableLanguages[languageIndex];
 }
 
@@ -272,13 +286,13 @@ async function getChapterPages(chapterId, pdfFinalPath, DownloadDir, tryNumber=0
     await imagesToPdf(paths,pdfFinalPath);
     paths.forEach(file => {fs.unlinkSync(file)});
     console.clear();
-    return {status:"success",chapter_id:chapterId, download_path:pdfFinalPath};
+    return {status:"succeed",chapter_id:chapterId, download_path:pdfFinalPath};
   }catch(error){
     console.log("\nDownload Failed");
     console.error(error.message);
     await sleep(2000);
     if(tryNumber > 2)
-      return {status:"failure",chapter_id:chapterId, download_path:pdfFinalPath};
+      return {status:"failed",chapter_id:chapterId, download_path:pdfFinalPath};
     tryNumber++;
     let res = await getChapterPages(chapterId, pdfFinalPath, DownloadDir, tryNumber);
     return res;
@@ -326,7 +340,6 @@ async function DownloadManga(name){
     let toChap;
     while(true){
       fromChap = parseInt(await question("From: "));
-      console.clear();
       toChap = parseInt(await question("To: "));
 
       if((0 <= fromChap  && fromChap < ChaptersObjs.length) &&
@@ -337,7 +350,7 @@ async function DownloadManga(name){
         if(fromChap == toChap)
           ChaptersObjs =  [ChaptersObjs[fromChap]];
         else
-          ChaptersObjs.slice(fromChap,toChap);
+          ChaptersObjs = ChaptersObjs.slice(fromChap,toChap+1);
 
         break;
       }
@@ -360,7 +373,11 @@ async function DownloadManga(name){
   let MangaFinalDestination = path.join(finalDestinationDir,mangaTitle);
 
   let chaptersDownoadLogs = await downloadChapters(ChaptersObjs,MangaTemporaryDownloadDirectory,MangaFinalDestination);
-  logs.forEach(chapLog=>{console.log(`${chapLog.download_path} Download was a ${chapLog.status}`)});
+  console.log();
+  chaptersDownoadLogs.forEach(chapLog=>{
+    if(chapLog.status  == "exist") console.loc(`"${chapLog.download_path}" already exist.`);
+    else console.log(`"${chapLog.download_path}" Download was ${chapLog.status}`);
+  });
 }
 
 let SearchKeyword = question("Enter Manga Name: ");
